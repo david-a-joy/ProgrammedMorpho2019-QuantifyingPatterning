@@ -25,6 +25,7 @@ To change the threshold used to segment the images
 # Imports
 
 # Standard lib
+import copy
 import shutil
 import pathlib
 import argparse
@@ -40,7 +41,8 @@ from scipy import ndimage as ndi
 
 from skimage.filters import gaussian
 from skimage.feature import peak_local_max
-from skimage.morphology import remove_small_objects, watershed
+from skimage.morphology import remove_small_objects
+from skimage.segmentation import watershed
 from skimage.measure import find_contours
 from skimage.io import imread
 
@@ -156,7 +158,7 @@ class TrackData(object):
         return len(self.frames)
 
     def __repr__(self) -> str:
-        return 'Track({}, {} frames)'.format(self.track_idx, len(self))
+        return f'Track({self.track_idx}, {len(self)} frames)'
 
     def plot_track(self,
                    frame_idx: int,
@@ -183,7 +185,7 @@ class TrackData(object):
         this_frame = self.frames.index(frame_idx)
 
         # Work out the color for this track using the track index and maximum track number
-        cmap = get_cmap('Set1')
+        cmap = copy.copy(get_cmap('Set1'))
         cmap.set_under('black')
         rgba = cmap((self.track_idx - 1)/(max_track_idx))
 
@@ -314,9 +316,20 @@ class OverlapTracker(object):
         # Load all the individual frames into a list of arrays, ignoring non-image files
         # All frames must be sortable by name, e.g. frame0001.tif, frame0002.tif, etc
         for frame_file in sorted(self.image_dir.iterdir()):
-            if frame_file.suffix != '.tif':
+            if frame_file.suffix not in ('.png', '.tif'):
                 continue
-            self.frames.append(imread(frame_file))
+            img = imread(frame_file).astype(np.float)
+            if img.ndim == 3:
+                img = np.mean(img, axis=2)
+            if img.ndim != 2:
+                raise ValueError(f'Expected 2D or 3D color image, got {img.shape}')
+            img_min = np.min(img)
+            img_max = np.max(img)
+            img = (img - img_min) / (img_max - img_min)
+            self.frames.append(img)
+
+        if len(self.frames) < 1:
+            raise OSError(f'No valid frames found under {self.image_dir}')
 
     def background_correct_frames(self):
         """ Perform background subtraction to get a smooth frame """
@@ -419,6 +432,29 @@ class OverlapTracker(object):
 
         self.track_stats = list(tracks.values())
 
+    def calculate_single_stats(self):
+        """ Calculate stats without linking frames """
+
+        # All the linked use the same indicies, so we can extract tracks by just counting
+        tracks: Dict[int, TrackData] = {}
+
+        for frame_idx, frame in enumerate(self.segmented_frames):
+
+            # Loop over any indicies in this frame
+            for track_idx in np.unique(frame):
+                if track_idx == 0:
+                    continue
+
+                # Always assign the track a new id
+                track_idx = len(tracks)
+
+                # Every frame is a new track
+                track = TrackData(track_idx)
+                track.append(frame_idx, frame)
+                tracks[track_idx] = track
+
+        self.track_stats = list(tracks.values())
+
     def plot_individual_frames(self, outdir: Optional[pathlib.Path] = None):
         """ Plot the tracks on individual frames
 
@@ -483,7 +519,7 @@ class OverlapTracker(object):
         # Find the larger of the two means and use that for the threshold
         m1, m2 = gmm.means_.ravel()
         threshold_abs = np.max([m1, m2])
-        print('Selecting threshold: {}'.format(threshold_abs))
+        print(f'Selecting threshold: {threshold_abs}')
         return threshold_abs
 
 
@@ -496,6 +532,9 @@ if __name__ == '__main__':
                         help='Directory to write tracked frames to (default is to plot them)')
     parser.add_argument('-t', '--threshold-abs', type=float,
                         help='Segmentation threshold to use to separate bright cells from dark background')
+    parser.add_argument('--only-segment', action='store_true',
+                        help="Only segment frames, don't try to link them")
+
     parser.add_argument('image_dir', type=pathlib.Path,
                         help='Directory with individual frames of the time series to track')
     args = parser.parse_args()
@@ -506,6 +545,10 @@ if __name__ == '__main__':
     tracker.load_frames()
     tracker.background_correct_frames()
     tracker.segment_frames()
-    tracker.link_frames()
-    tracker.calculate_stats()
+
+    if args.only_segment:
+        tracker.calculate_single_stats()
+    else:
+        tracker.link_frames()
+        tracker.calculate_stats()
     tracker.plot_individual_frames(outdir=args.outdir)
